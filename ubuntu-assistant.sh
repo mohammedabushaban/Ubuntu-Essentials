@@ -8,10 +8,10 @@
 #
 set -uo pipefail
 
-RAW="https://raw.githubusercontent.com/mhdhaidarah/Ubuntu-Essentials/main"
+RAW="RAW="https://raw.githubusercontent.com/mohammedabushaban/Ubuntu-Essentials/main"
 # One request for the whole repo instead of 35. A machine behind a slow link
 # used to spend a minute fetching snippets one at a time.
-TARBALL="https://codeload.github.com/mhdhaidarah/Ubuntu-Essentials/tar.gz/refs/heads/main"
+TARBALL="https://codeload.github.com/mohammedabushaban/Ubuntu-Essentials/tar.gz/refs/heads/main"
 CACHE_MAX_AGE_DAYS=7
 
 B=$'\033[1m'; DIM=$'\033[2m'; CYAN=$'\033[1;36m'; GREEN=$'\033[1;32m'; RED=$'\033[1;31m'; R=$'\033[0m'
@@ -211,7 +211,7 @@ fi
 
 echo
 echo "${CYAN}  Ubuntu Assistant${R} ${DIM}— Ubuntu Essentials, one pick away${R}"
-echo "${DIM}  sico.securytik.com · github.com/mhdhaidarah/Ubuntu-Essentials${R}"
+echo "${DIM}  github.com/mohammedabushaban/Ubuntu-Essentials${R}"
 [ -n "$CACHE_NOTE" ] && echo "${DIM}  $CACHE_NOTE${R}"
 if [ -n "$LAUNCHER_PATH" ]; then
   echo "${DIM}  next time just type${R} ${GREEN}$LAUNCHER_NAME${R} ${DIM}(or press ↑) — installed at $LAUNCHER_PATH${R}"
