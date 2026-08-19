@@ -8,7 +8,7 @@
 #
 set -uo pipefail
 
-RAW="RAW="https://raw.githubusercontent.com/mohammedabushaban/Ubuntu-Essentials/main"
+RAW="https://raw.githubusercontent.com/mohammedabushaban/Ubuntu-Essentials/main"
 # One request for the whole repo instead of 35. A machine behind a slow link
 # used to spend a minute fetching snippets one at a time.
 TARBALL="https://codeload.github.com/mohammedabushaban/Ubuntu-Essentials/tar.gz/refs/heads/main"
