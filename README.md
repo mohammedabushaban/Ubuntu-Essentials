@@ -121,6 +121,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/mhdhaidarah/Ubuntu-Essential
 | [`l2tp-client.sh`](l2tp-client.sh) | L2TP/IPsec VPN client wizard (strongSwan + xl2tpd), reboot-persistent, multi-VPN, auto-redial after a drop. |
 | [`l2tp-client-once.sh`](l2tp-client-once.sh) | **Temporary** L2TP client — a support tunnel that lives in `/tmp`, dies on reboot, and tears down with `sudo l2tp-once-down`. Nothing persistent is written. |
 | [`l2tp-server.sh`](l2tp-server.sh) | L2TP **server** (LNS) — add/remove users, see who's online, optional IPsec PSK. NATs its clients out to the internet. |
+| [`pptp-server.sh`](pptp-server.sh) | **PPTP server** for legacy/compatibility clients — add/remove users, fixed VPN IPs, online sessions, NAT, and ready-to-paste MikroTik/Ubuntu client configuration. |
+
+> **PPTP security warning:** PPTP/MS-CHAPv2 is weak and should only be used where legacy compatibility requires it. Prefer WireGuard or L2TP/IPsec for new deployments.
 | [`wireguard-client.sh`](wireguard-client.sh) | WireGuard tunnel wizard — generate keys, add/remove tunnels, enable on boot. |
 | [`wireguard-server.sh`](wireguard-server.sh) | WireGuard **server** — add/remove peers, print a peer's config + QR, list who's online. NATs its clients out to the internet. |
 

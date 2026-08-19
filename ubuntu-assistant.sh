@@ -36,6 +36,7 @@ ITEMS=(
   "VPN & uplinks|l2tp-client-once.sh|L2TP client (temporary)|One-shot support tunnel. Lives in /tmp, gone on reboot."
   "VPN & uplinks|l2tp-client.sh|L2TP client (permanent)|Reboot-persistent L2TP/IPsec client, multi-VPN."
   "VPN & uplinks|l2tp-server.sh|L2TP server|Run an LNS: add users, see who is online, NAT them online."
+  "VPN & uplinks|pptp-server.sh|PPTP server|Legacy compatibility PPTP server with users, sessions and NAT."
   "VPN & uplinks|wireguard-client.sh|WireGuard client|Add/remove WireGuard tunnels, enable on boot."
   "VPN & uplinks|wireguard-server.sh|WireGuard server|Serve peers: add/remove, QR configs, NAT them online."
   "VPN & uplinks|pppoe-client.sh|PPPoE client|Add/remove a persistent PPPoE dialer."
