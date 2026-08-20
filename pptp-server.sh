@@ -22,6 +22,15 @@ install_pptpd() {
   wget -qO /tmp/pptpd.tar.gz "$TARBALL_URL"
   tar xzf /tmp/pptpd.tar.gz -C /usr/local/src
   rm -f /tmp/pptpd.tar.gz
+  # compat.c only pulls in <string.h> when the system lacks strlcpy — on any
+  # current libc it has one, so the include never happens and strerror()/
+  # memset() end up implicitly declared. GCC 13 and earlier just warn about
+  # that; GCC 14+ (shipping in Ubuntu 24.10 and newer, including 26.04) treats
+  # it as a hard error and the build stops cold. Force the include unconditionally.
+  # (Checked as the literal first line, not "grep -q anywhere in the file" —
+  # the conditional include already matches a substring search, which would
+  # wrongly skip the fix.)
+  [ "$(head -1 "$SRC/compat.c")" = '#include <string.h>' ] || sed -i '1i #include <string.h>' "$SRC/compat.c"
   ( cd "$SRC" && ./configure && make && make install )
   # The plugins Makefile ignores $DESTDIR and always writes straight to
   # /usr/local/lib/pptpd — harmless here since that IS the real target, but
