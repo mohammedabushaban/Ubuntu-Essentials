@@ -1,750 +1,493 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
-
-###############################################################################
-# PPTP Server for Ubuntu 26.04
-# Backend: Accel-PPP
-#
-# WARNING:
-# PPTP/MS-CHAPv2 is legacy and cryptographically weak.
-# Use only when PPTP compatibility is required.
-###############################################################################
-
+sudo bash <<'EOF'
 export DEBIAN_FRONTEND=noninteractive
 
-APP="pptp-server"
-CONF_DIR="/etc/pptp-server"
-ENV_FILE="$CONF_DIR/server.env"
-ACCEL_CONF="/etc/accel-ppp.conf"
-CHAP_SECRETS="/etc/accel-ppp/chap-secrets"
-NAT_SCRIPT="/usr/local/sbin/pptp-server-nat"
-SYSTEMD_UNIT="/etc/systemd/system/accel-ppp.service"
-
-ACCEL_PREFIX="/usr/local"
-ACCEL_BIN="$ACCEL_PREFIX/sbin/accel-pppd"
-
-log()  { echo "[$APP] $*"; }
-ok()   { echo "[OK] $*"; }
-warn() { echo "[WARN] $*" >&2; }
-die()  { echo "[ERROR] $*" >&2; exit 1; }
-
-require_root() {
-    [ "$(id -u)" -eq 0 ] || die "Run this script with sudo."
-}
-
-cleanup_on_error() {
-    local rc=$?
-    if [ "$rc" -ne 0 ]; then
-        echo
-        echo "[ERROR] Installation/configuration failed."
-        echo "[ERROR] Existing configuration was not intentionally removed."
-    fi
-}
-trap cleanup_on_error EXIT
-
-###############################################################################
-# Detect Ubuntu
-###############################################################################
-
-check_os() {
-    [ -r /etc/os-release ] || die "/etc/os-release not found."
-
-    . /etc/os-release
-
-    if [ "${ID:-}" != "ubuntu" ]; then
-        die "This script supports Ubuntu only."
-    fi
-
-    if [ "${VERSION_ID:-}" != "26.04" ]; then
-        warn "This script is intended for Ubuntu 26.04."
-        warn "Detected Ubuntu ${VERSION_ID:-unknown}."
-        read -rp "Continue anyway? [y/N]: " ans
-        [[ "$ans" =~ ^[Yy]$ ]] || exit 1
-    fi
-
-    ok "Ubuntu ${VERSION_ID:-unknown} detected."
-}
-
-###############################################################################
-# Dependencies
-###############################################################################
-
-install_dependencies() {
-    log "Installing build/runtime dependencies..."
-
-    apt-get update
-
-    apt-get install -y \
-        build-essential \
-        cmake \
-        git \
-        pkg-config \
-        libpcre2-dev \
-        libssl-dev \
-        liblua5.4-dev \
-        libcap-dev \
-        libnl-3-dev \
-        libnl-route-3-dev \
-        libnetfilter-conntrack-dev \
-        iproute2 \
-        iptables \
-        ppp \
-        ca-certificates \
-        curl \
-        awk
-
-    ok "Dependencies installed."
-}
-
-###############################################################################
-# Build Accel-PPP
-###############################################################################
-
-install_accel_ppp() {
-
-    if [ -x "$ACCEL_BIN" ]; then
-        log "Accel-PPP already installed: $ACCEL_BIN"
-        return
-    fi
-
-    local BUILD
-    BUILD="$(mktemp -d)"
-
-    log "Downloading Accel-PPP source..."
-
-    git clone --depth 1 \
-        https://github.com/accel-ppp/accel-ppp.git \
-        "$BUILD/accel-ppp"
-
-    cd "$BUILD/accel-ppp"
-
-    mkdir -p build
-    cd build
-
-    log "Configuring Accel-PPP..."
-
-    cmake \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_INSTALL_PREFIX="$ACCEL_PREFIX" \
-        -DBUILD_DRIVER=TRUE \
-        -DRADIUS=TRUE \
-        -DSHAPER=TRUE \
-        -DNETSNMP=FALSE \
-        ..
-
-    log "Building Accel-PPP..."
-
-    make -j"$(nproc)"
-
-    log "Installing Accel-PPP..."
-
-    make install
-
-    ldconfig
-
-    cd /
-    rm -rf "$BUILD"
-
-    [ -x "$ACCEL_BIN" ] || die "Accel-PPP installation failed."
-
-    ok "Accel-PPP installed."
-}
-
-###############################################################################
-# Network input
-###############################################################################
-
-get_default_interface() {
-    ip -o -4 route show default 2>/dev/null |
-        awk '{print $5; exit}'
-}
-
-validate_ipv4_cidr() {
-    local value="$1"
-
-    [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]] ||
-        return 1
-
+# ── install pptpd, from apt if present, else built from source ────────────────
+# Canonical dropped the pptpd PACKAGE from Ubuntu's repos before 24.04 (it is
+# an old, weak protocol) — jammy (22.04) is the last release that ships it.
+# The pptpd 1.4.0 SOURCE still builds cleanly against any current libc/ppp
+# though: it only links against libc, and none of its own headers depend on
+# pppd's (the /usr/include/pppd/options.h some guides mention is unrelated —
+# that gap trips up people trying to reuse ppp-dev's headers, not this build).
+install_pptpd() {
+  command -v pptpd >/dev/null && return 0
+  apt-get update
+  if apt-get install -y pptpd 2>/dev/null; then
     return 0
+  fi
+  echo "  pptpd is not in this release's repos (removed since Ubuntu 24.04) — building 1.4.0 from source instead..."
+  apt-get install -y build-essential wget ca-certificates
+  local SRC="/usr/local/src/pptpd-1.4.0" TARBALL_URL="http://archive.ubuntu.com/ubuntu/pool/main/p/pptpd/pptpd_1.4.0.orig.tar.gz"
+  mkdir -p /usr/local/src
+  wget -qO /tmp/pptpd.tar.gz "$TARBALL_URL"
+  tar xzf /tmp/pptpd.tar.gz -C /usr/local/src
+  rm -f /tmp/pptpd.tar.gz
+  ( cd "$SRC" && ./configure && make && make install )
+  # The plugins Makefile ignores $DESTDIR and always writes straight to
+  # /usr/local/lib/pptpd — harmless here since that IS the real target, but
+  # worth knowing if this function is ever adapted to build into a package root.
+  command -v pptpd >/dev/null || { echo "  pptpd build failed — check the output above."; exit 1; }
+  echo "  built pptpd $(pptpd --version 2>&1) from source → /usr/local/sbin/pptpd"
 }
+install_pptpd
+command -v ppp >/dev/null || apt-get install -y ppp
+command -v iptables >/dev/null || apt-get install -y iptables
 
-validate_ipv4() {
-    local value="$1"
+mkdir -p /etc/pptp-server /etc/ppp
+chmod 700 /etc/pptp-server
 
-    [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] ||
-        return 1
+cat > /usr/local/sbin/pptp-server <<'SCRIPT'
+#!/bin/bash
+set -e
+[ "$EUID" -ne 0 ] && { echo "Run with sudo"; exit 1; }
 
-    return 0
-}
-
-###############################################################################
-# Server configuration
-###############################################################################
+ENVF="/etc/pptp-server/server.env"
+SECRETS="/etc/ppp/chap-secrets"
+SRVNAME="pptpd"                 # must match col 2 of chap-secrets and 'name' in options file
+SESSDIR="/run/pptp-sessions"
 
 setup_server() {
+  local DEF_WAN
+  DEF_WAN="$(ip -o -4 route show to default | awk '{print $5; exit}')"
 
-    local DEFAULT_WAN
-    DEFAULT_WAN="$(get_default_interface)"
+  read -rp "WAN interface (the uplink to NAT out of) [$DEF_WAN]: " WAN_IF; WAN_IF="${WAN_IF:-$DEF_WAN}"
+  read -rp "VPN subnet [10.8.0.0/24]: " SUBNET; SUBNET="${SUBNET:-10.8.0.0/24}"
+  # Dual-stack by default: a ULA prefix the clients get NAT66'd out of (no ISP prefix
+  # needed). Enter 'none' for IPv4-only.
+  read -rp "IPv6 ULA prefix (Enter=fc12::/64, or 'none'): " SUBNET6; SUBNET6="${SUBNET6:-fc12::/64}"
+  [ "$SUBNET6" = "none" ] && SUBNET6=""
+  # Google DNS. PPTP pushes IPv4 DNS via pppd ms-dns; the IPv6 DNS (Google) is set on
+  # the client by the connect snippet, since ms-dns is IPv4-only.
+  read -rp "DNS to hand to clients [8.8.8.8]: " DNS; DNS="${DNS:-8.8.8.8}"
 
-    [ -n "$DEFAULT_WAN" ] ||
-        die "Could not detect default WAN interface."
+  local BASE; BASE="${SUBNET%.*}"
+  LOCALIP="$BASE.1"
+  IPRANGE="$BASE.10-$BASE.200"
+  local PREFIX6="" SRV_IP6=""
+  if [ -n "$SUBNET6" ]; then PREFIX6="${SUBNET6%%/*}"; SRV_IP6="${PREFIX6}1"; fi
 
-    echo
-    echo "PPTP Server configuration"
-    echo "─────────────────────────"
-    echo
-
-    read -rp "WAN interface [$DEFAULT_WAN]: " WAN_IF
-    WAN_IF="${WAN_IF:-$DEFAULT_WAN}"
-
-    ip link show "$WAN_IF" >/dev/null 2>&1 ||
-        die "Interface '$WAN_IF' does not exist."
-
-    read -rp "VPN subnet [10.8.0.0/24]: " VPN_SUBNET
-    VPN_SUBNET="${VPN_SUBNET:-10.8.0.0/24}"
-
-    validate_ipv4_cidr "$VPN_SUBNET" ||
-        die "Invalid VPN subnet: $VPN_SUBNET"
-
-    read -rp "VPN gateway [10.8.0.1]: " VPN_GATEWAY
-    VPN_GATEWAY="${VPN_GATEWAY:-10.8.0.1}"
-
-    validate_ipv4 "$VPN_GATEWAY" ||
-        die "Invalid VPN gateway."
-
-    read -rp "VPN pool [10.8.0.10-10.8.0.200]: " VPN_POOL
-    VPN_POOL="${VPN_POOL:-10.8.0.10-10.8.0.200}"
-
-    read -rp "Primary DNS [1.1.1.1]: " DNS1
-    DNS1="${DNS1:-1.1.1.1}"
-
-    read -rp "Secondary DNS [8.8.8.8]: " DNS2
-    DNS2="${DNS2:-8.8.8.8}"
-
-    validate_ipv4 "$DNS1" || die "Invalid DNS1."
-    validate_ipv4 "$DNS2" || die "Invalid DNS2."
-
-    mkdir -p "$CONF_DIR"
-    mkdir -p "$(dirname "$CHAP_SECRETS")"
-    mkdir -p /var/log/accel-ppp
-    mkdir -p /run/accel-ppp
-
-    chmod 700 "$CONF_DIR"
-    chmod 700 "$(dirname "$CHAP_SECRETS")"
-
-    ###########################################################################
-    # Environment
-    ###########################################################################
-
-    cat > "$ENV_FILE" <<EOF
+  cat > "$ENVF" <<E
 WAN_IF=$WAN_IF
-VPN_SUBNET=$VPN_SUBNET
-VPN_GATEWAY=$VPN_GATEWAY
-VPN_POOL=$VPN_POOL
-DNS1=$DNS1
-DNS2=$DNS2
-EOF
+SUBNET=$SUBNET
+LOCALIP=$LOCALIP
+IPRANGE=$IPRANGE
+SUBNET6=$SUBNET6
+PREFIX6=$PREFIX6
+SRV_IP6=$SRV_IP6
+DNS="$DNS"
+E
+  chmod 600 "$ENVF"
 
-    chmod 600 "$ENV_FILE"
+  # pptpd.conf: localip is the server's tunnel address, remoteip is the pool handed
+  # to clients that don't have a fixed IP pinned in chap-secrets.
+  cat > /etc/pptpd.conf <<CONF
+option /etc/ppp/options.pptpd
+logwtmp
+localip $LOCALIP
+remoteip $IPRANGE
+CONF
 
-    ###########################################################################
-    # chap-secrets
-    ###########################################################################
+  # Note for the other side: unlike xl2tpd, pptpd has no separate control-channel
+  # keepalive of its own — everything rides over the single GRE+TCP session, so the
+  # lcp-echo settings below are the ONLY liveness detection. Keep them the same as
+  # the L2TP setup for consistency across both server types.
+  cat > /etc/ppp/options.pptpd <<OPT
+name $SRVNAME
+require-mschap-v2
+refuse-pap
+refuse-chap
+refuse-mschap
+auth
+noccp
+mtu 1400
+mru 1400
+proxyarp
+ms-dns $DNS
+lcp-echo-interval 30
+lcp-echo-failure 4
+connect-delay 5000
+$( [ -n "$SUBNET6" ] && printf '+ipv6\nipv6cp-accept-local\nipv6cp-accept-remote' )
+OPT
 
-    touch "$CHAP_SECRETS"
-    chmod 600 "$CHAP_SECRETS"
+  touch "$SECRETS"; chmod 600 "$SECRETS"
 
-    ###########################################################################
-    # Accel-PPP configuration
-    ###########################################################################
+  # ── this box is the clients' router ───────────────────────────────────────────
+  # Forward + NAT their traffic out of the WAN. Applied now and re-applied at boot,
+  # so it survives a reboot without pulling in iptables-persistent.
+  { echo "net.ipv4.ip_forward=1"; [ -n "$SUBNET6" ] && echo "net.ipv6.conf.all.forwarding=1"; } > /etc/sysctl.d/99-pptp-server.conf
+  sysctl -q -w net.ipv4.ip_forward=1
+  [ -n "$SUBNET6" ] && sysctl -q -w net.ipv6.conf.all.forwarding=1
 
-    cat > "$ACCEL_CONF" <<EOF
-[modules]
-log_file
-connlimit
-pptp
-auth_mschap_v2
-chap-secrets
-ippool
-
-[core]
-thread-count=$(nproc)
-log-error=/var/log/accel-ppp/core.log
-
-[common]
-max-sessions=500
-session-timeout=0
-check-ip=1
-
-[ppp]
-verbose=0
-min-mtu=1280
-mtu=1400
-mru=1400
-accomp=deny
-pcomp=deny
-ccp=1
-mppe=require
-ipv4=require
-ipv6=deny
-lcp-echo-interval=30
-lcp-echo-failure=4
-
-[auth]
-timeout=5
-interval=0
-max-failure=3
-any-login=0
-
-[pptp]
-verbose=0
-port=1723
-echo-interval=30
-echo-failure=3
-timeout=5
-mppe=require
-ppp-max-mtu=1400
-ip-pool=pptp
-ifname=pptp%d
-
-[ip-pool]
-gw-ip-address=$VPN_GATEWAY
-192.0.2.1/32
-pptp=$VPN_POOL
-
-[dns]
-dns1=$DNS1
-dns2=$DNS2
-
-[log]
-log-file=/var/log/accel-ppp/accel-ppp.log
-log-emerg=/var/log/accel-ppp/emerg.log
-log-failure=/var/log/accel-ppp/failure.log
-copy=1
-color=0
-
-[connlimit]
-limit=20
-burst=5
-timeout=300
-EOF
-
-    chmod 600 "$ACCEL_CONF"
-
-    ###########################################################################
-    # Sysctl
-    ###########################################################################
-
-    cat > /etc/sysctl.d/99-pptp-server.conf <<EOF
-net.ipv4.ip_forward=1
-net.ipv4.conf.all.rp_filter=0
-net.ipv4.conf.default.rp_filter=0
-net.ipv4.conf.all.accept_source_route=0
-net.ipv4.conf.default.accept_source_route=0
-EOF
-
-    sysctl --system >/dev/null
-
-    ###########################################################################
-    # NAT
-    ###########################################################################
-
-    cat > "$NAT_SCRIPT" <<'EOF'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-
+  cat > /usr/local/sbin/pptp-server-nat <<'NAT'
+#!/bin/bash
+# Idempotent: -C tests for the rule, and we only add what is missing.
 . /etc/pptp-server/server.env
-
 sysctl -q -w net.ipv4.ip_forward=1
+iptables -t nat -C POSTROUTING -s "$SUBNET" -o "$WAN_IF" -j MASQUERADE 2>/dev/null || \
+  iptables -t nat -A POSTROUTING -s "$SUBNET" -o "$WAN_IF" -j MASQUERADE
+iptables -C FORWARD -s "$SUBNET" -o "$WAN_IF" -j ACCEPT 2>/dev/null || \
+  iptables -A FORWARD -s "$SUBNET" -o "$WAN_IF" -j ACCEPT
+iptables -C FORWARD -d "$SUBNET" -i "$WAN_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+  iptables -A FORWARD -d "$SUBNET" -i "$WAN_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+# PPP links are MTU-limited; without this, big packets over the tunnel black-hole.
+iptables -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
+  iptables -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+# GRE (proto 47) carries the actual PPP payload alongside the TCP:1723 control
+# channel. Without explicitly accepting it, some default-deny FORWARD/INPUT
+# policies will silently blackhole every PPTP session after the TCP handshake.
+iptables -C INPUT -p gre -j ACCEPT 2>/dev/null || iptables -A INPUT -p gre -j ACCEPT
+iptables -C FORWARD -p gre -j ACCEPT 2>/dev/null || iptables -A FORWARD -p gre -j ACCEPT
 
-iptables -t nat -C POSTROUTING \
-    -s "$VPN_SUBNET" \
-    -o "$WAN_IF" \
-    -j MASQUERADE 2>/dev/null ||
-iptables -t nat -A POSTROUTING \
-    -s "$VPN_SUBNET" \
-    -o "$WAN_IF" \
-    -j MASQUERADE
+# Dual-stack: same story over IPv6 — clients live in a ULA and are NAT66'd out (no ISP
+# prefix delegation needed). Per-session client routes are added by the ppp ip-up hook.
+if [ -n "$SUBNET6" ]; then
+  sysctl -q -w net.ipv6.conf.all.forwarding=1
+  ip6tables -t nat -C POSTROUTING -s "$SUBNET6" -o "$WAN_IF" -j MASQUERADE 2>/dev/null || \
+    ip6tables -t nat -A POSTROUTING -s "$SUBNET6" -o "$WAN_IF" -j MASQUERADE
+  ip6tables -C FORWARD -s "$SUBNET6" -o "$WAN_IF" -j ACCEPT 2>/dev/null || \
+    ip6tables -A FORWARD -s "$SUBNET6" -o "$WAN_IF" -j ACCEPT
+  ip6tables -C FORWARD -d "$SUBNET6" -i "$WAN_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+    ip6tables -A FORWARD -d "$SUBNET6" -i "$WAN_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+fi
+NAT
+  chmod +x /usr/local/sbin/pptp-server-nat
 
-iptables -C FORWARD \
-    -s "$VPN_SUBNET" \
-    -o "$WAN_IF" \
-    -j ACCEPT 2>/dev/null ||
-iptables -A FORWARD \
-    -s "$VPN_SUBNET" \
-    -o "$WAN_IF" \
-    -j ACCEPT
-
-iptables -C FORWARD \
-    -d "$VPN_SUBNET" \
-    -i "$WAN_IF" \
-    -m conntrack \
-    --ctstate ESTABLISHED,RELATED \
-    -j ACCEPT 2>/dev/null ||
-iptables -A FORWARD \
-    -d "$VPN_SUBNET" \
-    -i "$WAN_IF" \
-    -m conntrack \
-    --ctstate ESTABLISHED,RELATED \
-    -j ACCEPT
-
-iptables -C FORWARD \
-    -s "$VPN_SUBNET" \
-    -o "$WAN_IF" \
-    -p tcp \
-    --tcp-flags SYN,RST SYN \
-    -j TCPMSS \
-    --clamp-mss-to-pmtu 2>/dev/null ||
-iptables -A FORWARD \
-    -s "$VPN_SUBNET" \
-    -o "$WAN_IF" \
-    -p tcp \
-    --tcp-flags SYN,RST SYN \
-    -j TCPMSS \
-    --clamp-mss-to-pmtu
-
-# PPTP control channel
-iptables -C INPUT -p tcp --dport 1723 -j ACCEPT 2>/dev/null ||
-iptables -A INPUT -p tcp --dport 1723 -j ACCEPT
-
-# PPTP GRE
-iptables -C INPUT -p gre -j ACCEPT 2>/dev/null ||
-iptables -A INPUT -p gre -j ACCEPT
-
-iptables -C FORWARD -p gre -j ACCEPT 2>/dev/null ||
-iptables -A FORWARD -p gre -j ACCEPT
-EOF
-
-    chmod 700 "$NAT_SCRIPT"
-
-    ###########################################################################
-    # systemd NAT service
-    ###########################################################################
-
-    cat > /etc/systemd/system/pptp-server-nat.service <<EOF
+  cat > /etc/systemd/system/pptp-server-nat.service <<UNIT
 [Unit]
-Description=PPTP Server NAT
+Description=PPTP server NAT/forwarding rules
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=$NAT_SCRIPT
 RemainAfterExit=yes
+ExecStart=/usr/local/sbin/pptp-server-nat
 
 [Install]
 WantedBy=multi-user.target
-EOF
+UNIT
 
-    ###########################################################################
-    # systemd Accel-PPP
-    ###########################################################################
+  # Session tracking: pppd runs these on every connect/disconnect, which is the only
+  # reliable way to map a ppp interface back to the username that dialled it.
+  mkdir -p /etc/ppp/ip-up.d /etc/ppp/ip-down.d
+  cat > /etc/ppp/ip-up.d/pptp-server <<'UP'
+#!/bin/bash
+# args: $1 iface  $2 tty  $3 speed  $4 local-ip  $5 remote-ip  $6 ipparam
+mkdir -p /run/pptp-sessions
+{ echo "USER=${PEERNAME:-unknown}"; echo "IP=$5"; echo "SINCE=$(date +%s)"; } > "/run/pptp-sessions/$1"
 
-    cat > "$SYSTEMD_UNIT" <<EOF
+# Dual-stack: give the client a global ULA derived from its IPv4 host number
+# (10.8.0.10 -> fc12::10) and route it back over this ppp link; NAT66 (set by
+# pptp-server-nat) rewrites the source out of the WAN. The client configures the
+# matching fc12::<n>/64 + default v6 route itself — see the connect snippet.
+. /etc/pptp-server/server.env 2>/dev/null
+if [ -n "$SUBNET6" ]; then
+  octet="${5##*.}"
+  ip -6 route replace "${PREFIX6}${octet}/128" dev "$1" 2>/dev/null || true
+  echo "IP6=${PREFIX6}${octet}" >> "/run/pptp-sessions/$1"
+fi
+UP
+  cat > /etc/ppp/ip-down.d/pptp-server <<'DOWN'
+#!/bin/bash
+rm -f "/run/pptp-sessions/$1"
+DOWN
+  chmod +x /etc/ppp/ip-up.d/pptp-server /etc/ppp/ip-down.d/pptp-server
+
+  # The apt package ships pptpd.service; a from-source build (see install_pptpd
+  # above) does not, so create it if it's missing rather than assume either path.
+  if [ ! -f /etc/systemd/system/pptpd.service ] && [ ! -f /lib/systemd/system/pptpd.service ]; then
+    cat > /etc/systemd/system/pptpd.service <<UNIT
 [Unit]
-Description=Accel-PPP PPTP Server
-After=network-online.target pptp-server-nat.service
+Description=PPTP Daemon
+After=network-online.target
 Wants=network-online.target
-Requires=pptp-server-nat.service
 
 [Service]
 Type=simple
-ExecStart=$ACCEL_BIN -c $ACCEL_CONF -p /run/accel-ppp/accel-ppp.pid
-Restart=always
-RestartSec=3
-
-LimitNOFILE=1048576
-TasksMax=4096
-
-PrivateTmp=true
-ProtectSystem=full
-ProtectHome=true
-
-NoNewPrivileges=false
+ExecStart=$(command -v pptpd) --fg --conf /etc/pptpd.conf --option /etc/ppp/options.pptpd
+Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
-EOF
+UNIT
+  fi
 
-    systemctl daemon-reload
+  systemctl daemon-reload
+  systemctl enable --now pptp-server-nat.service >/dev/null 2>&1 || true
+  systemctl enable pptpd >/dev/null 2>&1 || true
+  systemctl restart pptpd
 
-    systemctl enable --now pptp-server-nat.service
+  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "^Status: active"; then
+    ufw allow 1723/tcp >/dev/null 2>&1 || true
+    echo "  (opened TCP 1723 in ufw — note: ufw does not filter GRE by protocol number,"
+    echo "   so if you have a default-deny setup double check GRE isn't blocked elsewhere)"
+  fi
 
-    systemctl enable accel-ppp.service
-
-    systemctl restart accel-ppp.service
-
-    sleep 2
-
-    if systemctl is-active --quiet accel-ppp.service; then
-        ok "Accel-PPP is running."
-    else
-        systemctl status accel-ppp.service --no-pager || true
-        journalctl -u accel-ppp.service -n 80 --no-pager || true
-        die "Accel-PPP failed to start."
-    fi
-
-    ###########################################################################
-    # UFW
-    ###########################################################################
-
-    if command -v ufw >/dev/null 2>&1 &&
-       ufw status 2>/dev/null | grep -q "^Status: active"; then
-
-        warn "UFW is active."
-
-        ufw allow 1723/tcp comment 'PPTP control' >/dev/null || true
-
-        # UFW does not provide a simple 'allow protocol 47' syntax
-        # compatible with every version. Warn instead of modifying
-        # /etc/ufw/before.rules blindly.
-        warn "GRE protocol 47 must also be permitted by your firewall."
-    fi
-
-    echo
-    echo "════════════════════════════════════════════════════════════"
-    echo " PPTP SERVER READY"
-    echo "════════════════════════════════════════════════════════════"
-    echo
-    echo "WAN:       $WAN_IF"
-    echo "VPN:       $VPN_SUBNET"
-    echo "Pool:      $VPN_POOL"
-    echo "Gateway:   $VPN_GATEWAY"
-    echo "DNS:       $DNS1 / $DNS2"
-    echo
-    echo "Control:   TCP/1723"
-    echo "Payload:   GRE / protocol 47"
-    echo
-    echo "Service:"
-    echo "  systemctl status accel-ppp"
-    echo
-    echo "Logs:"
-    echo "  journalctl -u accel-ppp -f"
-    echo "  tail -f /var/log/accel-ppp/accel-ppp.log"
-    echo
-    echo "Security:"
-    echo "  PPTP/MS-CHAPv2 is legacy and weak."
-    echo "  Use only for compatibility."
-    echo "════════════════════════════════════════════════════════════"
+  echo
+  echo "PPTP server up. Clients get $IPRANGE and reach the internet through $WAN_IF."
+  echo "Security note: PPTP/MS-CHAPv2 is considered weak/breakable — prefer L2TP/IPSec"
+  echo "or WireGuard where the client supports it. Use PPTP only for compatibility."
+  echo "Add a user with option 2."
 }
 
-###############################################################################
-# Users
-###############################################################################
+users_list() {
+  mapfile -t USERS < <(awk -v s="$SRVNAME" '$2==s && $1 !~ /^#/ {print $1}' "$SECRETS" 2>/dev/null)
+}
+
+# Lowest address in the pool ($IPRANGE = BASE.10-BASE.200) not already pinned to one
+# of our users. Auto-pinning a fixed v4 is what gives every client a STABLE v6
+# (fc12::<v4-host>), so the connect snippet can always hand out the right address.
+next_free_ip() {
+  local lo hi base start end o used
+  lo="${IPRANGE%-*}"; hi="${IPRANGE#*-}"
+  base="${lo%.*}"; start="${lo##*.}"; end="${hi##*.}"
+  used="$(awk -v s="$SRVNAME" -v b="$base" '$2==s && $4 ~ ("^" b "\\.") {n=split($4,a,"."); print a[n]}' "$SECRETS" 2>/dev/null)"
+  for (( o=start; o<=end; o++ )); do
+    printf '%s\n' $used | grep -qx "$o" || { echo "$base.$o"; return; }
+  done
+  echo ""   # pool exhausted
+}
 
 add_user() {
+  [ -f "$ENVF" ] || { echo "Set the server up first (option 1)."; return 1; }
+  . "$ENVF"
+  read -rp "Username: " U
+  [ -z "$U" ] && { echo "Username required."; return 1; }
+  users_list
+  printf '%s\n' "${USERS[@]}" | grep -qx "$U" && { echo "User '$U' already exists."; return 1; }
+  while :; do read -rsp "Password: " P; echo; [ -n "$P" ] && break; echo "  Required."; done
 
-    [ -f "$ENV_FILE" ] ||
-        die "Run setup first."
-
-    . "$ENV_FILE"
-
-    echo
-    read -rp "Username: " USERNAME
-
-    [ -n "$USERNAME" ] ||
-        die "Username is required."
-
-    [[ "$USERNAME" =~ ^[a-zA-Z0-9._-]+$ ]] ||
-        die "Invalid username."
-
-    if awk -v u="$USERNAME" '$1 == u {found=1} END {exit !found}' \
-        "$CHAP_SECRETS"; then
-
-        die "User '$USERNAME' already exists."
+  # Every user gets a STUCK (fixed) v4 by default so its v6 is stable too. Enter accepts
+  # the auto-picked next-free address; or type a specific one.
+  local NET="${SUBNET%.*}" DEF_IP; DEF_IP="$(next_free_ip)"
+  while :; do
+    if [ -n "$DEF_IP" ]; then
+      read -rp "Fixed VPN IP  [Enter = $DEF_IP]: " FIXED; FIXED="${FIXED:-$DEF_IP}"
+    else
+      read -rp "Fixed VPN IP  (pool full — type one in $NET.0/24): " FIXED
     fi
+    case "$FIXED" in "$NET."[0-9]*) ;; *) echo "  Enter an address inside $NET.0/24 (e.g. $NET.10)."; continue ;; esac
+    local o="${FIXED##*.}"
+    if ! [ "$o" -ge 2 ] 2>/dev/null || [ "$o" -gt 254 ]; then echo "  Host part must be 2-254."; continue; fi
+    if awk -v s="$SRVNAME" -v ip="$FIXED" '$2==s && $4==ip{f=1} END{exit !f}' "$SECRETS"; then
+      echo "  $FIXED is already pinned to another user — pick a different one."; continue
+    fi
+    break
+  done
 
-    read -rsp "Password: " PASSWORD
-    echo
-
-    [ -n "$PASSWORD" ] ||
-        die "Password is required."
-
-    printf '%s\tPPTP\t%s\t*\n' \
-        "$USERNAME" "$PASSWORD" >> "$CHAP_SECRETS"
-
-    chmod 600 "$CHAP_SECRETS"
-
-    ok "User '$USERNAME' added."
+  printf '%s\t%s\t%s\t%s\n' "$U" "$SRVNAME" "$P" "$FIXED" >> "$SECRETS"
+  chmod 600 "$SECRETS"
+  echo
+  echo "Added '$U'. Client settings:"
+  echo "    Server:   $(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || echo '<this box public IP>')"
+  echo "    Username: $U"
+  [ -n "$SUBNET6" ] && echo "    IPv6:     dual-stack (ULA $SUBNET6, NAT66)"
+  echo "  No pptpd restart needed — pppd reads chap-secrets on each connect."
+  connect_snippet "$U" "$P" "$FIXED"
 }
 
-###############################################################################
+del_user() {
+  users_list
+  [ "${#USERS[@]}" -eq 0 ] && { echo "No users yet."; return; }
+  echo "Users:"
+  local i
+  for i in "${!USERS[@]}"; do echo "  $((i+1))) ${USERS[$i]}"; done
+  read -rp "Choose number: " C
+  local T="${USERS[$((C-1))]}"
+  [ -z "$T" ] && { echo "Invalid."; return; }
+  read -rp "Really remove '$T'? [y/N]: " Y
+  [ "$Y" != "y" ] && [ "$Y" != "Y" ] && { echo "Cancelled."; return; }
+
+  # Only ever touch our own rows: username in col 1 AND our server name in col 2.
+  awk -v u="$T" -v s="$SRVNAME" '!($1==u && $2==s)' "$SECRETS" > "$SECRETS.tmp"
+  mv "$SECRETS.tmp" "$SECRETS"; chmod 600 "$SECRETS"
+
+  # Kick them off if they are connected right now — deleting the secret alone only stops
+  # the NEXT dial; the live pppd keeps the session up until it is killed.
+  local f ifc pidf
+  for f in "$SESSDIR"/*; do
+    [ -e "$f" ] || continue
+    ifc="$(basename "$f")"
+    # subshell: sourcing the session file would clobber $USER in this shell
+    if [ "$(. "$f"; echo "$USER")" = "$T" ]; then
+      echo "  disconnecting live session on $ifc..."
+      # pppd's pidfile name differs between ppp 2.4 (Ubuntu 22/24) and ppp 2.5
+      # (Ubuntu 26) — try both layouts rather than assume one.
+      for pidf in "/run/$ifc.pid" "/var/run/$ifc.pid" "/run/pppd-$ifc.pid" "/var/run/pppd-$ifc.pid"; do
+        [ -f "$pidf" ] || continue
+        kill "$(cat "$pidf")" 2>/dev/null || true
+        break
+      done
+      rm -f "$f"
+    fi
+  done
+  echo "Removed '$T'."
+}
 
 list_users() {
+  users_list
+  [ "${#USERS[@]}" -eq 0 ] && { echo "No users yet."; return; }
+  declare -A ONLINE_IP ONLINE_SINCE ONLINE_IF
+  local f now
+  now="$(date +%s)"
+  for f in "$SESSDIR"/*; do
+    [ -e "$f" ] || continue
+    ( . "$f"; echo "$USER|$IP|$SINCE|$(basename "$f")" )
+  done > /tmp/.pptp-sess.$$ 2>/dev/null || true
+  while IFS='|' read -r u ip since ifc; do
+    [ -n "$u" ] && { ONLINE_IP["$u"]="$ip"; ONLINE_SINCE["$u"]="$since"; ONLINE_IF["$u"]="$ifc"; }
+  done < /tmp/.pptp-sess.$$
+  rm -f /tmp/.pptp-sess.$$
 
-    echo
-    printf "%-24s %-12s\n" "USERNAME" "STATUS"
-    printf "%-24s %-12s\n" "--------" "------"
-
-    awk '
-        $0 !~ /^[[:space:]]*#/ && NF >= 2 {
-            print $1
-        }
-    ' "$CHAP_SECRETS" 2>/dev/null |
-    while read -r U; do
-        if pgrep -af "accel-pppd" 2>/dev/null |
-            grep -q "$U"; then
-            printf "%-24s %-12s\n" "$U" "configured"
-        else
-            printf "%-24s %-12s\n" "$U" "configured"
-        fi
-    done
-}
-
-###############################################################################
-
-remove_user() {
-
-    local U
-
-    read -rp "Username to remove: " U
-
-    [ -n "$U" ] ||
-        die "Username required."
-
-    if ! awk -v u="$U" '$1 == u {found=1} END {exit !found}' \
-        "$CHAP_SECRETS"; then
-
-        die "User '$U' not found."
+  printf "%-16s %-9s %-13s %-8s %s\n" "USER" "STATE" "VPN IP" "IFACE" "UPTIME"
+  local u up
+  for u in "${USERS[@]}"; do
+    if [ -n "${ONLINE_IP[$u]:-}" ]; then
+      up=$(( now - ${ONLINE_SINCE[$u]:-$now} ))
+      printf "%-16s %-9s %-13s %-8s %s\n" "$u" "ONLINE" "${ONLINE_IP[$u]}" "${ONLINE_IF[$u]}" "$((up/60))m $((up%60))s"
+    else
+      printf "%-16s %-9s %-13s %-8s %s\n" "$u" "offline" "-" "-" "-"
     fi
-
-    read -rp "Remove '$U'? [y/N]: " CONFIRM
-
-    [[ "$CONFIRM" =~ ^[Yy]$ ]] || {
-        echo "Cancelled."
-        return
-    }
-
-    awk -v u="$U" '$1 != u' "$CHAP_SECRETS" > "$CHAP_SECRETS.tmp"
-
-    mv "$CHAP_SECRETS.tmp" "$CHAP_SECRETS"
-    chmod 600 "$CHAP_SECRETS"
-
-    ok "User '$U' removed."
+  done
 }
 
-###############################################################################
-# Status
-###############################################################################
-
-status_server() {
-
-    echo
-    echo "PPTP / Accel-PPP status"
-    echo "────────────────────────"
-
-    systemctl is-active accel-ppp.service &&
-        echo "Service: ACTIVE" ||
-        echo "Service: INACTIVE"
-
-    echo
-    echo "Listening:"
-    ss -lntp 2>/dev/null |
-        grep ':1723' ||
-        echo "TCP 1723 is not listening."
-
-    echo
-    echo "GRE:"
-    cat /proc/net/gre 2>/dev/null || true
-
-    echo
-    echo "PPTP interfaces:"
-    ip -o link show 2>/dev/null |
-        grep -E 'pptp[0-9]+' ||
-        echo "No active PPTP sessions."
-
-    echo
-    echo "Configured users:"
-    awk '$0 !~ /^[[:space:]]*#/ && NF >= 2 {print "  " $1}' \
-        "$CHAP_SECRETS" 2>/dev/null || true
-
-    echo
-    echo "Recent logs:"
-    journalctl -u accel-ppp.service -n 20 --no-pager || true
+show_user() {
+  users_list
+  [ "${#USERS[@]}" -eq 0 ] && { echo "No users yet."; return; }
+  echo "Users:"
+  local i
+  for i in "${!USERS[@]}"; do echo "  $((i+1))) ${USERS[$i]}"; done
+  read -rp "Choose number: " C
+  local T="${USERS[$((C-1))]}"
+  [ -z "$T" ] && { echo "Invalid."; return; }
+  . "$ENVF"
+  local PW FIXED
+  PW="$(awk -v u="$T" -v s="$SRVNAME" '$1==u && $2==s {print $3; exit}' "$SECRETS")"
+  FIXED="$(awk -v u="$T" -v s="$SRVNAME" '$1==u && $2==s {print $4; exit}' "$SECRETS")"
+  echo "───────── $T ─────────"
+  echo "Server:    $(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || echo '<this box public IP>')"
+  echo "Username:  $T"
+  echo "Password:  $PW"
+  echo "VPN IP:    $( [ "$FIXED" = "*" ] && echo "from pool $IPRANGE" || echo "$FIXED (pinned)" )"
+  echo "Gateway:   this server ($LOCALIP) — all client internet is NAT'd out of $WAN_IF"
+  [ -n "$SUBNET6" ] && echo "IPv6:      dual-stack on (ULA $SUBNET6, NAT66 out $WAN_IF)"
+  echo "──────────────────────"
+  connect_snippet "$T" "$PW" "$FIXED"
 }
 
-###############################################################################
-# Firewall diagnostics
-###############################################################################
+# Offer a ready-to-paste snippet the CLIENT runs to dial this server — so the far side
+# doesn't hand-build the PPTP config. $1 user, $2 password, $3 pinned-v4-or-'*'.
+connect_snippet() {
+  local U="$1" P="$2" FIXED="$3"
+  . "$ENVF"
+  local SRV; SRV="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || echo '<server-public-ip>')"
+  # Client v6 is derived from the pinned v4 host number; pool users get it per-session.
+  local V6=""; [ -n "$SUBNET6" ] && [ "$FIXED" != "*" ] && [ -n "$FIXED" ] && V6="${PREFIX6}${FIXED##*.}"
 
-firewall_status() {
-
-    echo
-    echo "PPTP firewall rules"
-    echo "───────────────────"
-
-    echo
-    echo "TCP/1723:"
-    iptables -C INPUT -p tcp --dport 1723 -j ACCEPT 2>/dev/null &&
-        echo "  ACCEPT" ||
-        echo "  NOT explicitly allowed"
-
-    echo
-    echo "GRE:"
-    iptables -C INPUT -p gre -j ACCEPT 2>/dev/null &&
-        echo "  ACCEPT" ||
-        echo "  NOT explicitly allowed"
-
-    echo
-    echo "NAT:"
-    iptables -t nat -S POSTROUTING 2>/dev/null |
-        grep "$VPN_SUBNET" || true
+  echo
+  read -rp "Print a ready-to-paste connect snippet for the client? [1] MikroTik  [2] Ubuntu  [Enter] skip: " WANT
+  case "$WANT" in
+    1)
+      echo
+      echo "═══ MikroTik — paste into the client router's terminal ═══"
+      # One line per command (no '\' continuations) so it pastes cleanly by any method.
+      echo "/interface pptp-client add name=pptp-securytik connect-to=$SRV user=$U password=$P add-default-route=yes disabled=no"
+      # Google DNS (v4 + v6) on the client, since PPTP's ms-dns only carries IPv4.
+      echo "/ip dns set servers=8.8.8.8,2001:4860:4860::8888"
+      if [ -n "$SUBNET6" ]; then
+        [ -n "$V6" ] && echo "/ipv6 address add address=$V6/64 interface=pptp-securytik advertise=no" \
+                     || echo "# IPv6: pin this user to a fixed IP to get a stable v6; then fc12::<host>"
+        echo "/ipv6 route add dst-address=::/0 gateway=pptp-securytik"
+        # Stop this router from advertising itself on the tunnel (else it can inject a
+        # default route into the SERVER and cost the server its own internet).
+        echo "/ipv6 nd add interface=pptp-securytik ra-lifetime=0s"
+      fi
+      echo "═════════════════════════════════════════════════════════"
+      ;;
+    2)
+      # IPv6 lines, only when the server is dual-stack AND this user has a pinned v6.
+      # A client ipv6-up.d hook re-adds the ULA + v6 default route on every (re)connect,
+      # so IPv6 survives reboots/redials. $1 (the ppp iface) must stay literal in the
+      # generated hook, hence \$1 here.
+      # NOTE: this whole block ends up inside the pasted  sudo bash -c '...'  so it must
+      # contain NO single quotes (they'd close the outer '...'). The hook is written with
+      # a double-quoted heredoc; \$1 stays literal at paste time (the ppp iface).
+      local v6opt="" v6hook=""
+      if [ -n "$SUBNET6" ] && [ -n "$V6" ]; then
+        v6opt=$'+ipv6\nipv6cp-accept-local\nipv6cp-accept-remote'
+        v6hook="mkdir -p /etc/ppp/ipv6-up.d
+cat > /etc/ppp/ipv6-up.d/securytik-v6 <<\"HEOF\"
+#!/bin/bash
+ip -6 addr add $V6/64 dev \"\$1\" 2>/dev/null || true
+ip -6 route replace default dev \"\$1\" 2>/dev/null || true
+HEOF
+chmod +x /etc/ppp/ipv6-up.d/securytik-v6"
+      fi
+      echo
+      echo "═══ Ubuntu — paste into the client's shell (installs pptp-linux if missing) ═══"
+      cat <<UB
+sudo bash -c '
+export DEBIAN_FRONTEND=noninteractive
+command -v pptp >/dev/null || { apt-get update && apt-get install -y pptp-linux; }
+mkdir -p /etc/ppp/peers
+cat > /etc/ppp/peers/securytik <<PP
+pty "pptp $SRV --nolaunchpppd"
+name "$U"
+password "$P"
+remotename PPTP
+require-mschap-v2
+refuse-eap
+refuse-pap
+refuse-chap
+noauth
+noccp
+mtu 1400
+mru 1400
+noipdefault
+defaultroute
+replacedefaultroute
+usepeerdns
+persist
+maxfail 0
+holdoff 5
+lcp-echo-interval 10
+lcp-echo-failure 6
+${v6opt}
+PP
+chmod 600 /etc/ppp/peers/securytik
+${v6hook}
+pon securytik
+sleep 8; ip -4 addr show | grep ppp && ip -6 addr show | grep -i fc1 || echo "check journalctl -u pptpd or /var/log/syslog"
+'
+UB
+      echo "════════════════════════════════════════════════════════════════════════════"
+      ;;
+    *) : ;;
+  esac
 }
 
-###############################################################################
-# Main
-###############################################################################
+echo "PPTP Server"
+echo "  1) Set up / reconfigure the server"
+echo "  2) Add a user"
+echo "  3) List users (online status)"
+echo "  4) Show a user's connection details"
+echo "  5) Remove a user"
+echo "  6) Server status"
+read -rp "Choose: " CHOICE
+case "$CHOICE" in
+  1) setup_server ;;
+  2) add_user ;;
+  3) list_users ;;
+  4) show_user ;;
+  5) del_user ;;
+  6) systemctl is-active pptpd >/dev/null 2>&1 && echo "pptpd: active" || echo "pptpd: inactive"
+     echo; echo "Live sessions:"; ls "$SESSDIR" 2>/dev/null || echo "  none"
+     echo; ip -o -4 addr show 2>/dev/null | grep ppp || true ;;
+  *) echo "Invalid choice"; exit 1 ;;
+esac
+SCRIPT
+chmod +x /usr/local/sbin/pptp-server
+echo "Installed. Run:  sudo pptp-server"
+EOF
 
-require_root
-check_os
-install_dependencies
-install_accel_ppp
-
-while true; do
-
-    echo
-    echo "PPTP Server"
-    echo "────────────────────────────"
-    echo "  1) Set up / reconfigure"
-    echo "  2) Add user"
-    echo "  3) List users"
-    echo "  4) Remove user"
-    echo "  5) Server status"
-    echo "  6) Firewall status"
-    echo "  7) Restart server"
-    echo "  q) Quit"
-    echo
-
-    read -rp "Choose: " CHOICE
-
-    case "$CHOICE" in
-        1)
-            setup_server
-            ;;
-        2)
-            add_user
-            ;;
-        3)
-            list_users
-            ;;
-        4)
-            remove_user
-            ;;
-        5)
-            status_server
-            ;;
-        6)
-            firewall_status
-            ;;
-        7)
-            systemctl restart accel-ppp.service
-            systemctl is-active accel-ppp.service
-            ;;
-        q|Q)
-            break
-            ;;
-        *)
-            echo "Invalid choice."
-            ;;
-    esac
-done
+sudo pptp-server
